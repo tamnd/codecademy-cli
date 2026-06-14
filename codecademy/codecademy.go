@@ -1,114 +1,215 @@
-// Package codecademy is the library behind the codecademy command line:
-// the HTTP client, request shaping, and the typed data models for codecademy.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Package codecademy scrapes the Codecademy course catalog.
 package codecademy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to codecademy. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "codecademy/dev (+https://github.com/tamnd/codecademy-cli)"
-
-// Client talks to codecademy over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config controls the HTTP client behaviour.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://www.codecademy.com",
+		Rate:      300 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
+		UserAgent: "codecademy-cli/0.1 (github.com/tamnd/codecademy-cli)",
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+// Client fetches Codecademy data.
+type Client struct {
+	cfg     Config
+	http    *http.Client
+	last    time.Time
+	buildID string
+}
+
+// NewClient creates a Client from cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+var buildIDRe = regexp.MustCompile(`"buildId"\s*:\s*"([^"]+)"`)
+
+type catalogResponse struct {
+	PageProps struct {
+		InitialCatalogResults struct {
+			TotalResults int          `json:"totalResults"`
+			TotalPages   int          `json:"totalPages"`
+			PageItems    []catalogItem `json:"pageItems"`
+		} `json:"initialCatalogResults"`
+	} `json:"pageProps"`
+}
+
+type catalogItem struct {
+	Slug              string `json:"slug"`
+	Title             string `json:"title"`
+	Type              string `json:"type"`
+	Difficulty        string `json:"difficulty"`
+	LessonCount       int    `json:"lessonCount"`
+	TimeToComplete    int    `json:"timeToComplete"`
+	Pro               bool   `json:"pro"`
+	GrantsCertificate bool   `json:"grantsCertificate"`
+	ShortDescription  string `json:"shortDescription"`
+	URLPath           string `json:"urlPath"`
+}
+
+// ListCourses fetches all catalog items across all pages.
+func (c *Client) ListCourses(ctx context.Context, limit int) ([]Course, error) {
+	if err := c.ensureBuildID(ctx); err != nil {
+		return nil, err
+	}
+	var all []Course
+	rank := 1
+	for page := 1; ; page++ {
+		items, total, err := c.fetchPage(ctx, page)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range items {
+			url := c.cfg.BaseURL + it.URLPath
+			if it.URLPath == "" {
+				url = c.cfg.BaseURL + "/learn/" + it.Slug
+			}
+			all = append(all, Course{
+				Rank:             rank,
+				Slug:             it.Slug,
+				Title:            it.Title,
+				Type:             it.Type,
+				Difficulty:       it.Difficulty,
+				LessonCount:      it.LessonCount,
+				TimeToComplete:   it.TimeToComplete, // hours
+				Pro:              it.Pro,
+				Certificate:      it.GrantsCertificate,
+				ShortDescription: it.ShortDescription,
+				URL:              url,
+			})
+			rank++
+			if limit > 0 && len(all) >= limit {
+				return all, nil
+			}
+		}
+		if rank > total || len(items) == 0 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// Search returns courses whose title or slug matches query (case-insensitive).
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Course, error) {
+	all, err := c.ListCourses(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	q := strings.ToLower(query)
+	var out []Course
+	for _, course := range all {
+		if strings.Contains(strings.ToLower(course.Title), q) ||
+			strings.Contains(strings.ToLower(course.Slug), q) ||
+			strings.Contains(strings.ToLower(course.ShortDescription), q) {
+			out = append(out, course)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	for i := range out {
+		out[i].Rank = i + 1
+	}
+	return out, nil
+}
+
+func (c *Client) ensureBuildID(ctx context.Context) error {
+	if c.buildID != "" {
+		return nil
+	}
+	body, err := c.fetch(ctx, "/catalog")
+	if err != nil {
+		return fmt.Errorf("discovering build ID: %w", err)
+	}
+	m := buildIDRe.FindSubmatch(body)
+	if m == nil {
+		return fmt.Errorf("could not find Next.js buildId in /catalog")
+	}
+	c.buildID = string(m[1])
+	return nil
+}
+
+func (c *Client) fetchPage(ctx context.Context, page int) ([]catalogItem, int, error) {
+	path := fmt.Sprintf("/_next/data/%s/catalog.json?page=%d", c.buildID, page)
+	body, err := c.fetch(ctx, path)
+	if err != nil {
+		return nil, 0, err
+	}
+	var resp catalogResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("parsing catalog page %d: %w", page, err)
+	}
+	r := resp.PageProps.InitialCatalogResults
+	return r.PageItems, r.TotalResults, nil
+}
+
+func (c *Client) fetch(ctx context.Context, path string) ([]byte, error) {
+	url := c.cfg.BaseURL + path
+	var last error
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+			case <-time.After(time.Duration(attempt) * time.Second):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
+		c.pace()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
 			return nil, err
 		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			last = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		}
+		return io.ReadAll(resp.Body)
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("all retries failed for %s: %w", url, last)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
-}
-
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
 }

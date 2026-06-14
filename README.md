@@ -1,10 +1,8 @@
 # codecademy
 
-A command line for codecademy.
+Browse and search the [Codecademy](https://www.codecademy.com) course catalog from the command line.
 
-`codecademy` is a single pure-Go binary. It speaks to codecademy over plain
-HTTPS, shapes the responses into clean records, and pipes into the rest of your
-tools. No API key, nothing to run alongside it.
+`codecademy` is a single pure-Go binary. No API key required.
 
 ## Install
 
@@ -12,8 +10,7 @@ tools. No API key, nothing to run alongside it.
 go install github.com/tamnd/codecademy-cli/cmd/codecademy@latest
 ```
 
-Or grab a prebuilt binary from the [releases](https://github.com/tamnd/codecademy-cli/releases), or run
-the container image:
+Or grab a prebuilt binary from the [releases](https://github.com/tamnd/codecademy-cli/releases), or run the container image:
 
 ```bash
 docker run --rm ghcr.io/tamnd/codecademy:latest --help
@@ -22,41 +19,42 @@ docker run --rm ghcr.io/tamnd/codecademy:latest --help
 ## Usage
 
 ```bash
-codecademy --help
-codecademy version
+# List all 800+ courses
+codecademy list
+
+# List first 20 courses in table format
+codecademy list -n 20 -o table
+
+# Search by title, slug, or description
+codecademy search "python"
+codecademy search "machine learning" -n 10
+
+# Output formats
+codecademy list -o json
+codecademy list -o csv -n 50
+codecademy search "javascript" -o jsonl
 ```
 
-This is a fresh scaffold. The command tree starts with `version`; build out the
-real commands in `cli/` on top of the `codecademy` library package.
+## Commands
 
-## Development
+| Command | Description |
+|---------|-------------|
+| `list` | List all courses in the Codecademy catalog |
+| `search <query>` | Search courses by title, slug, or description (case-insensitive) |
+| `version` | Show version information |
+
+## Global flags
 
 ```
-cmd/codecademy/   thin main, wires cli.Root into fang
-cli/                 the cobra command tree
-codecademy/                the library: HTTP client and data models
-docs/                tago documentation site
+-o, --output string    output format: table|json|jsonl|csv|tsv|url|raw (default "auto")
+-n, --limit int        limit number of records (0 = all)
+    --fields strings   comma-separated columns to include
+    --no-header        omit header row
+    --template string  Go text/template per record
+    --timeout duration per-request timeout (default 30s)
+    --delay duration   minimum spacing between requests
+    --retries int      retry attempts on 429/5xx (default 3)
 ```
-
-```bash
-make build      # ./bin/codecademy
-make test       # go test ./...
-make vet        # go vet ./...
-```
-
-## Releasing
-
-Push a version tag and GitHub Actions runs GoReleaser, which builds the
-archives, Linux packages, the multi-arch GHCR image, checksums, SBOMs, and a
-cosign signature:
-
-```bash
-git tag v0.1.0
-git push --tags
-```
-
-The Homebrew and Scoop steps self-disable until their tokens exist, so the first
-release works with no extra secrets.
 
 ## License
 
